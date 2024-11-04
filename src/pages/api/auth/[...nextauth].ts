@@ -1,4 +1,5 @@
 import NextAuth from 'next-auth'
+import axios from 'axios'
 import type { NextAuthOptions } from 'next-auth'
 import Auth0Provider from 'next-auth/providers/auth0'
 
@@ -22,7 +23,8 @@ export const authOptions: NextAuthOptions = {
       clientId,
       clientSecret,
       issuer,
-      authorization: { params: { audience: `${issuer}/api/v2/`, scope: 'access_token_authz openid email profile read:current_user create:current_user_metadata update:current_user_metadata read:stats update:area_attrs' } },
+      authorization: { params: { audience: 'https://api.openbeta.io', scope: 'offline_access access_token_authz openid email profile read:current_user create:current_user_metadata update:current_user_metadata read:stats update:area_attrs' } },
+
       client: {
         token_endpoint_auth_method: clientSecret.length === 0 ? 'none' : 'client_secret_basic'
       }
@@ -43,12 +45,29 @@ export const authOptions: NextAuthOptions = {
   callbacks: {
     // See https://next-auth.js.org/configuration/callbacks#jwt-callback
     async jwt ({ token, account, profile, user }) {
+      /**
+       * `account` object is only populated once when the user first logged in.
+       */
       if (account?.access_token != null) {
         token.accessToken = account.access_token
       }
+
+      if (account?.refresh_token != null) {
+        token.refreshToken = account.refresh_token
+      }
+
+      /**
+       * `account.expires_at` is set in Auth0 custom API
+       *  Applications -> API -> (OB Climb API) -> Access Token Settings -> Implicit/Hybrid Access Token Lifetime
+       */
+      if (account?.expires_at != null) {
+        token.expiresAt = account.expires_at
+      }
+
       if (profile?.sub != null) {
         token.id = profile.sub
       }
+
       // @ts-expect-error
       if (profile?.[CustomClaimUserMetadata] != null) {
         // null guard needed because profile object is only available once
@@ -61,8 +80,20 @@ export const authOptions: NextAuthOptions = {
         })
       }
 
+      if (token?.refreshToken == null || token?.expiresAt == null) {
+        throw new Error('Invalid auth data')
+      }
+
+      if ((token.expiresAt as number) < (Date.now() / 1000)) {
+        const { accessToken, refreshToken, expiresAt } = await refreshAccessTokenSilently(token.refreshToken as string)
+        token.accessToken = accessToken
+        token.refreshToken = refreshToken
+        token.expiresAt = expiresAt
+      }
+
       return token
     },
+
     async session ({ session, user, token }) {
       if (token.userMetadata == null ||
         token?.userMetadata?.uuid == null || token?.userMetadata?.nick == null) {
@@ -79,3 +110,36 @@ export const authOptions: NextAuthOptions = {
 }
 
 export default NextAuth(authOptions)
+
+const refreshAccessTokenSilently = async (refreshToken: string): Promise<any> => {
+  const response = await axios.request<{
+    access_token: string
+    refresh_token: string
+    expires_in: number
+  }>({
+    method: 'POST',
+    url: `${issuer}/oauth/token`,
+    headers: { 'content-type': 'application/json' },
+    data: JSON.stringify({
+      grant_type: 'refresh_token',
+      client_id: clientId,
+      client_secret: clientSecret,
+      refresh_token: refreshToken
+    })
+  })
+
+  /* eslint-disable @typescript-eslint/naming-convention */
+  const {
+    access_token, refresh_token, expires_in
+  } = response.data
+
+  if (access_token == null || refresh_token == null || expires_in == null) {
+    throw new Error('Missing data in refresh token flow')
+  }
+
+  return {
+    accessToken: access_token,
+    refreshToken: refresh_token,
+    expiresAt: Math.floor((Date.now() / 1000) + expires_in)
+  }
+}
